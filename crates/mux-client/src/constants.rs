@@ -23,7 +23,7 @@ def_constants!(MUX_S_TTY_ALLOC_FAIL, 0x80000008);
 // MUX_C_CLOSE_FWD is not yet supported by openssh
 // MUX_C_NEW_STDIO_FWD is not supported by this crate
 
-//def_constants!(MUX_C_CLOSE_FWD,         0x10000007);
+def_constants!(MUX_C_CLOSE_FWD, 0x10000007);
 //def_constants!(MUX_C_NEW_STDIO_FWD,     0x10000008);
 
 def_constants!(MUX_FWD_LOCAL, 1);

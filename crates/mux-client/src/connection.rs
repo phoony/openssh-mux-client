@@ -375,6 +375,59 @@ impl Connection {
         Ok(())
     }
 
+    async fn send_close_forward_request(&mut self, request_id: u32, fwd: &Fwd<'_>) -> Result<()> {
+        let (fwd_mode, listen_socket, connect_socket) = fwd.as_serializable();
+        let (listen_addr, listen_port) = listen_socket.as_serializable();
+        let (connect_addr, connect_port) = connect_socket.as_ref().as_serializable();
+
+        let serialized_listen_port = serialize_u32(listen_port);
+        let serialized_connect_port = serialize_u32(connect_port);
+
+        let listen_addr_len: u32 = listen_addr.get_len_as_u32()?;
+        let connect_addr_len: u32 = connect_addr.get_len_as_u32()?;
+
+        let request = Request::CloseFwd {
+            request_id,
+            fwd_mode,
+        };
+
+        // Serialize
+        self.reset_serializer();
+
+        request.serialize(&mut self.serializer)?;
+        let serialized_header = self.serializer.create_header(
+            // len
+            4 +
+            listen_addr_len +
+            // port
+            4 +
+            // len
+            4 +
+            connect_addr_len
+            // port
+            + 4,
+        )?;
+
+        let serialized_listen_addr_len = serialize_u32(listen_addr_len);
+        let serialized_connect_addr_len = serialize_u32(connect_addr_len);
+
+        // Write them to self.raw_conn
+        let mut io_slices = [
+            IoSlice::new(&serialized_header),
+            IoSlice::new(&self.serializer.output),
+            IoSlice::new(&serialized_listen_addr_len),
+            IoSlice::new(listen_addr.into_inner()),
+            IoSlice::new(&serialized_listen_port),
+            IoSlice::new(&serialized_connect_addr_len),
+            IoSlice::new(connect_addr.into_inner()),
+            IoSlice::new(&serialized_connect_port),
+        ];
+
+        write_vectored_all(&mut self.raw_conn, &mut io_slices).await?;
+
+        Ok(())
+    }
+
     /// Request for local/remote port forwarding.
     ///
     /// # Warning
@@ -402,6 +455,52 @@ impl Connection {
 
         let request_id = self.get_request_id();
         self.send_fwd_request(request_id, &fwd).await?;
+
+        match self.read_response().await? {
+            Ok { response_id } => Self::check_response_id(request_id, response_id),
+            PermissionDenied {
+                response_id,
+                reason,
+            } => {
+                Self::check_response_id(request_id, response_id)?;
+                Err(Error::PermissionDenied(reason))
+            }
+            Failure {
+                response_id,
+                reason,
+            } => {
+                Self::check_response_id(request_id, response_id)?;
+                Err(Error::RequestFailure(reason))
+            }
+            response => Err(Error::invalid_server_response(
+                &"Ok, PermissionDenied or Failure",
+                &response,
+            )),
+        }
+    }
+
+    pub async fn request_port_close(
+        &mut self,
+        forward_type: ForwardType,
+        listen_socket: &Socket<'_>,
+        connect_socket: &Socket<'_>,
+    ) -> Result<()> {
+        use ForwardType::*;
+        use Response::*;
+
+        let fwd = match forward_type {
+            Local => Fwd::Local {
+                listen_socket,
+                connect_socket,
+            },
+            Remote => Fwd::Remote {
+                listen_socket,
+                connect_socket,
+            },
+        };
+
+        let request_id = self.get_request_id();
+        self.send_close_forward_request(request_id, &fwd).await?;
 
         match self.read_response().await? {
             Ok { response_id } => Self::check_response_id(request_id, response_id),
@@ -673,7 +772,7 @@ mod tests {
     );
 
     async fn test_local_socket_forward_impl(conn0: Connection, mut conn1: Connection) {
-        let path = Path::new("/tmp/openssh-local-forward.socket").into();
+        let path: Cow<'_, Path> = Path::new("/tmp/openssh-local-forward.socket").into();
 
         eprintln!("Creating remote process");
         let cmd = format!("socat -u OPEN:/data UNIX-LISTEN:{:#?} >/dev/stderr", path);
@@ -704,6 +803,24 @@ mod tests {
         output.read_exact(&mut buffer).await.unwrap();
 
         assert_eq!(DATA, buffer);
+
+        eprintln!("Requesting closing of port forward");
+        let path: Cow<'_, Path> = Path::new("/tmp/openssh-local-forward.socket").into();
+        conn1
+            .request_port_close(
+                ForwardType::Local,
+                &Socket::TcpSocket {
+                    port: 1235,
+                    host: "127.0.0.1".into(),
+                },
+                &Socket::UnixSocket { path },
+            )
+            .await
+            .unwrap();
+
+        TcpStream::connect(("127.0.0.1", 1235))
+            .await
+            .expect_err("Should fail");
 
         drop(output);
         drop(stdios);
